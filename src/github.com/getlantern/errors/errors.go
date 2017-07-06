@@ -59,7 +59,6 @@ package errors
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -93,8 +92,23 @@ type Error interface {
 	error
 	context.Contextual
 
-	// MultiLinePrinter implements the interface golog.MultiLine
-	MultiLinePrinter() func(buf *bytes.Buffer) bool
+	// ErrorClean returns a non-parameterized version of the error whenever
+	// possible. For example, if the error text is:
+	//
+	//     unable to dial www.google.com caused by: i/o timeout
+	//
+	// ErrorClean might return:
+	//
+	//     unable to dial %v caused by: %v
+	//
+	// This can be useful when performing analytics on the error.
+	ErrorClean() string
+
+	// PrintStack prints the stacktrace when this Error is created, together
+	// with the cause of this Error (if any), then the stacktrace when the
+	// cause is created, and so on.
+	// The output is an analogy of Java's stacktrace.
+	PrintStack(w io.Writer, linePrefix string)
 
 	// Op attaches a hint of the operation triggers this Error. Many error types
 	// returned by net and os package have Op pre-filled.
@@ -138,7 +152,7 @@ func NewOffset(offset int, desc string, args ...interface{}) Error {
 			break
 		}
 	}
-	e := buildError(fmt.Sprintf(desc, args...), nil, Wrap(cause))
+	e := buildError(desc, fmt.Sprintf(desc, args...), nil, Wrap(cause))
 	e.attachStack(2 + offset)
 	return e
 }
@@ -202,58 +216,28 @@ func (e *structured) RootCause() error {
 	return e.cause.RootCause()
 }
 
-// Error satisfies the error interface
-func (e *structured) Error() string {
-	return e.data["error"].(string) + e.hiddenID
+func (e *structured) ErrorClean() string {
+	return e.data["error"].(string)
 }
 
-func (e *structured) MultiLinePrinter() func(buf *bytes.Buffer) bool {
-	first := true
-	indent := false
+// Error satisfies the error interface
+func (e *structured) Error() string {
+	return e.data["error_text"].(string) + e.hiddenID
+}
+
+func (e *structured) PrintStack(w io.Writer, linePrefix string) {
 	err := e
-	stackPosition := 0
-	switchedCause := false
-	return func(buf *bytes.Buffer) bool {
-		if indent {
-			buf.WriteString("  ")
-		}
-		if first {
-			buf.WriteString(e.Error())
-			first = false
-			indent = true
-			return true
-		}
-		if switchedCause {
-			fmt.Fprintf(buf, "Caused by: %v", err)
-			if err.callStack != nil && len(err.callStack) > 0 {
-				switchedCause = false
-				indent = true
-				return true
-			}
-			if err.cause == nil {
-				return false
-			}
-			err = err.cause.(*structured)
-			return true
-		}
-		if stackPosition < len(err.callStack) {
-			buf.WriteString("at ")
+	for {
+		for stackPosition := 0; stackPosition < len(err.callStack); stackPosition++ {
 			call := err.callStack[stackPosition]
-			fmt.Fprintf(buf, "%+n (%s:%d)", call, call, call)
-			stackPosition++
+			fmt.Fprintf(w, "%s  at %+n (%s:%d)\n", linePrefix, call, call, call)
 		}
-		if stackPosition >= len(err.callStack) {
-			switch cause := err.cause.(type) {
-			case *structured:
-				err = cause
-				indent = false
-				stackPosition = 0
-				switchedCause = true
-			default:
-				return false
-			}
+		cause, ok := err.cause.(*structured)
+		if !ok || cause == nil {
+			return
 		}
-		return err != nil
+		err = cause
+		fmt.Fprintf(w, "%sCaused by: %v\n", linePrefix, err)
 	}
 }
 
@@ -276,15 +260,16 @@ func wrapSkipFrames(err error, skip int) Error {
 	}
 
 	// Create a new *structured
-	return buildError(err.Error(), err, cause)
+	return buildError("", "", err, cause)
 }
 
 func (e *structured) attachStack(skip int) {
 	call := stack.Caller(skip)
 	e.callStack = stack.Trace().TrimBelow(call)
+	e.data["error_location"] = fmt.Sprintf("%+n (%s:%d)", call, call, call)
 }
 
-func buildError(desc string, wrapped error, cause Error) *structured {
+func buildError(desc string, fullText string, wrapped error, cause Error) *structured {
 	e := &structured{
 		data: make(context.Map),
 		// We capture the current context to allow it to propagate to higher layers.
@@ -308,7 +293,14 @@ func buildError(desc string, wrapped error, cause Error) *structured {
 			}
 		}
 	}
-	e.data["error"] = hidden.Clean(desc)
+
+	cleanedDesc := hidden.Clean(desc)
+	e.data["error"] = cleanedDesc
+	if fullText != "" {
+		e.data["error_text"] = hidden.Clean(fullText)
+	} else {
+		e.data["error_text"] = cleanedDesc
+	}
 	e.data["error_type"] = errorType
 
 	return e

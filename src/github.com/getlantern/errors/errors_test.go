@@ -54,18 +54,17 @@ func TestNewWithCause(t *testing.T) {
 	cause := buildCause()
 	outer := New("Hello %v", cause)
 	assert.Equal(t, "Hello World", hidden.Clean(outer.Error()))
+	assert.Equal(t, "Hello %v", outer.(*structured).ErrorClean())
+	assert.Equal(t,
+		"github.com/getlantern/errors.TestNewWithCause (errors_test.go:999)",
+		replaceNumbers.ReplaceAllString(outer.(*structured).data["error_location"].(string), "999"))
 	assert.Equal(t, cause, outer.(*structured).cause)
 
 	// Make sure that stacktrace prints out okay
 	buf := &bytes.Buffer{}
-	print := outer.MultiLinePrinter()
-	for {
-		more := print(buf)
-		buf.WriteByte('\n')
-		if !more {
-			break
-		}
-	}
+	buf.WriteString(outer.Error())
+	buf.WriteByte('\n')
+	outer.PrintStack(buf, "")
 	expected := `Hello World
   at github.com/getlantern/errors.TestNewWithCause (errors_test.go:999)
   at testing.tRunner (testing.go:999)
